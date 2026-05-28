@@ -29,9 +29,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
-
-
 # =============================================================================
 # 工具路径解析
 # =============================================================================
@@ -78,7 +75,8 @@ def resolve_tools() -> dict[str, str]:
 
     tools = {
         "hdc": _find_tool(hdc_name, "HDC_PATH") or hdc_name,
-        "hvigorw": _find_tool(hvigorw_name, "HVIGOR_HOME", "${HVIGOR_HOME}/bin") or hvigorw_name,
+        "hvigorw": _find_tool(hvigorw_name, "HVIGOR_HOME", "${HVIGOR_HOME}/bin")
+        or hvigorw_name,
     }
     node = _find_tool(node_name, "NODE_HOME", "${NODE_HOME}/bin")
     if node:
@@ -86,29 +84,62 @@ def resolve_tools() -> dict[str, str]:
     java = _find_tool(java_name, "JAVA_HOME", "${JAVA_HOME}/bin")
     if java:
         tools["java"] = java
-    ohpm = _find_tool(ohpm_name, "OHPM_HOME", "${OHPM_HOME}/bin") or shutil.which("ohpm")
+    ohpm = _find_tool(ohpm_name, "OHPM_HOME", "${OHPM_HOME}/bin") or shutil.which(
+        "ohpm"
+    )
     if ohpm:
         tools["ohpm"] = ohpm
     return tools
 
 
 # =============================================================================
-# YAML 加载
+# 配置文件加载（无需 pyyaml，纯内置库解析）
 # =============================================================================
 
 
-def load_yaml(path: str) -> dict:
+def _extract_json_array(text: str, key: str) -> list:
+    """从类 YAML 文本中提取 key 对应的 JSON 数组值。"""
+    m = re.search(rf"{re.escape(key)}\s*:\s*\[", text)
+    if not m:
+        sys.exit(f"[ERROR] 配置缺少字段: {key}")
+    start = m.end() - 1  # '[' 的位置
+    depth, end, in_str, escape = 1, start + 1, False, False
+    while end < len(text) and depth > 0:
+        c = text[end]
+        if escape:
+            escape = False
+        elif c == "\\":
+            escape = True
+        elif c == '"':
+            in_str = not in_str
+        elif not in_str:
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+        end += 1
+    if depth != 0:
+        sys.exit(f"[ERROR] {key} 的 JSON 数组括号不匹配")
+    return json.loads(text[start:end])
+
+
+def load_config(path: str) -> dict:
     p = Path(path)
     if not p.exists():
-        sys.exit(f"[ERROR] YAML 文件不存在: {path}")
+        sys.exit(f"[ERROR] 配置文件不存在: {path}")
     with open(p, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    for k in ("signingConfigs", "bundleName"):
-        if k not in cfg:
-            sys.exit(f"[ERROR] YAML 缺少字段: {k}")
-    if not isinstance(cfg["signingConfigs"], list):
-        sys.exit("[ERROR] signingConfigs 必须是数组")
-    return cfg
+        text = f.read()
+
+    # 提取 signingConfigs（JSON 数组）
+    signing_configs = _extract_json_array(text, "signingConfigs")
+
+    # 提取 bundleName（支持引号包裹或裸字符串）
+    m = re.search(r"""bundleName\s*:\s*["']?([^"'\s#]+)""", text)
+    if not m:
+        sys.exit("[ERROR] 配置缺少字段: bundleName")
+    bundle_name = m.group(1)
+
+    return {"signingConfigs": signing_configs, "bundleName": bundle_name}
 
 
 # =============================================================================
@@ -198,7 +229,9 @@ def _find_value_range(text: str, key: str, start: int = 0) -> tuple[int, int] | 
     return None
 
 
-def set_json5(file_path: str, key: str, new_value_text: str, parent_key: str | None = None) -> None:
+def set_json5(
+    file_path: str, key: str, new_value_text: str, parent_key: str | None = None
+) -> None:
     """原地替换 JSON5 文件中 key 对应的值。
 
     parent_key: 如果 key 嵌套在某个父 key 下，先定位父 key 的值范围，再在其内查找 key。
@@ -275,7 +308,9 @@ def configure_app(project_dir: str, bundle_name: str) -> None:
     try:
         app_obj = json.loads(_clean_json5_for_parsing(raw_app))
     except json.JSONDecodeError as e:
-        sys.exit(f"[ERROR] 无法解析 app.json5 中的 app 对象: {e}\n内容: {raw_app[:200]}")
+        sys.exit(
+            f"[ERROR] 无法解析 app.json5 中的 app 对象: {e}\n内容: {raw_app[:200]}"
+        )
 
     # 更新 bundleName
     app_obj["bundleName"] = bundle_name
@@ -544,10 +579,14 @@ def launch(hdc: str, bundle_name: str, dry_run: bool) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HarmonyOS 配置/编译/部署/启动一体脚本")
+    parser = argparse.ArgumentParser(
+        description="HarmonyOS 配置/编译/部署/启动一体脚本"
+    )
     parser.add_argument("-y", "--yaml", required=True, help="YAML 配置文件路径")
     parser.add_argument("-p", "--project", required=True, help="鸿蒙工程根目录")
-    parser.add_argument("--dry-run", action="store_true", help="仅预览，不实际编译/安装/启动")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="仅预览，不实际编译/安装/启动"
+    )
     parser.add_argument("--skip-build", action="store_true", help="跳过编译")
     parser.add_argument("--skip-config", action="store_true", help="跳过配置写入")
     args = parser.parse_args()
@@ -564,7 +603,7 @@ def main() -> None:
         print(f"  {k:8s} → {v}")
 
     # ---- YAML ----
-    cfg = load_yaml(args.yaml)
+    cfg = load_config(args.yaml)
     bundle = cfg["bundleName"]
     signing = cfg["signingConfigs"]
     print(f"\nYAML 配置:")
