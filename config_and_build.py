@@ -2,15 +2,16 @@
 """
 HarmonyOS 工程配置 → 编译 → 部署 → 启动 一体脚本。
 
-- 从 YAML 读取 signingConfigs / bundleName
+- 从配置文件读取 signingConfigs / bundleName
 - 写入 AppScope/app.json5（bundleName）和 build-profile.json5（signingConfigs）
 - 调用 hvigorw assembleHap 编译
-- 查找 *-signed.hap 并 hdc install 到设备
+- 查找 *-signed.hap，hdc install 到设备并校验安装结果
 - hdc shell aa start 启动应用
 
 用法：
-  python config_and_build.py --yaml ./config.yaml --project D:/MyHarmonyApp
-  python config_and_build.py --yaml ./config.yaml --project D:/MyHarmonyApp --dry-run
+  python config_and_build.py --project D:/MyHarmonyApp
+  python config_and_build.py --project D:/MyHarmonyApp --dry-run
+  python config_and_build.py --yaml ./other-config.yaml --project D:/MyHarmonyApp
 
 环境变量（可选，未设置时从 PATH 查找）：
   HVIGOR_HOME    hvigor 安装根目录（如 D:/Huawei/DevEcoStudio/tools/hvigor）
@@ -27,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # =============================================================================
@@ -484,7 +486,133 @@ def find_hap(project_dir: str) -> str | None:
 # =============================================================================
 
 
-def install(hdc: str, hap_path: str, dry_run: bool) -> bool:
+def _print_output_tail(output: str, lines: int = 10) -> None:
+    for line in output.split("\n")[-lines:]:
+        if line.strip():
+            print(f"  | {line.strip()}")
+
+
+def _is_existing_bundle_install_error(output: str, bundle_name: str) -> bool:
+    lower = output.lower()
+    conflict_keywords = (
+        "already",
+        "exist",
+        "exists",
+        "installed",
+        "signature",
+        "sign",
+        "same",
+        "conflict",
+        "duplicate",
+        "已存在",
+        "已安装",
+        "签名",
+        "同包名",
+        "包名",
+        "冲突",
+    )
+    return bundle_name.lower() in lower or any(k in lower for k in conflict_keywords)
+
+
+def _bundle_exists_on_device(hdc: str, bundle_name: str) -> bool:
+    try:
+        r = subprocess.run(
+            [hdc, "shell", "bm", "dump", "-n", bundle_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return False
+
+    output = (r.stdout or "") + (r.stderr or "")
+    lower = output.lower()
+    missing_markers = (
+        "not exist",
+        "not exists",
+        "not found",
+        "does not exist",
+        "failed",
+        "error",
+        "不存在",
+        "未找到",
+        "失败",
+    )
+    if r.returncode != 0 or any(marker in lower for marker in missing_markers):
+        return False
+    return bundle_name.lower() in lower or "ability:" in lower
+
+
+def _wait_for_bundle_on_device(
+    hdc: str, bundle_name: str, attempts: int = 6, delay: float = 2.0
+) -> bool:
+    for i in range(attempts):
+        if _bundle_exists_on_device(hdc, bundle_name):
+            return True
+        if i < attempts - 1:
+            time.sleep(delay)
+    return False
+
+
+def _run_install(hdc: str, hap_path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [hdc, "install", "-r", hap_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+
+
+def _run_uninstall(hdc: str, bundle_name: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [hdc, "uninstall", bundle_name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+
+
+def _clean_reinstall(
+    hdc: str, hap_path: str, bundle_name: str, require_uninstall_success: bool
+) -> bool:
+    uninstall_cmd = [hdc, "uninstall", bundle_name]
+    print(f"  执行: {' '.join(uninstall_cmd)}")
+    uninstall = _run_uninstall(hdc, bundle_name)
+    if uninstall.returncode != 0:
+        output = (uninstall.stdout or "") + (uninstall.stderr or "")
+        if require_uninstall_success:
+            print("[ERROR] 卸载原应用失败")
+            _print_output_tail(output)
+            return False
+        print("  [WARN] 卸载原应用未成功，继续重试安装")
+        _print_output_tail(output, lines=5)
+    else:
+        print("  [OK] 原应用已卸载")
+
+    cmd = [hdc, "install", "-r", hap_path]
+    print(f"  执行: {' '.join(cmd)}")
+    retry = _run_install(hdc, hap_path)
+    if retry.returncode != 0:
+        print("[ERROR] 重试安装失败")
+        _print_output_tail((retry.stdout or "") + (retry.stderr or ""))
+        return False
+
+    print("  等待设备确认安装结果 ...")
+    if not _wait_for_bundle_on_device(hdc, bundle_name):
+        print(f"[ERROR] 重试安装后仍未在设备上检测到包: {bundle_name}")
+        _print_output_tail((retry.stdout or "") + (retry.stderr or ""))
+        return False
+
+    return True
+
+
+def install(hdc: str, hap_path: str, bundle_name: str, dry_run: bool) -> bool:
     print(f"\n>>> [5/6] 安装 HAP 到设备")
 
     if not dry_run:
@@ -508,21 +636,39 @@ def install(hdc: str, hap_path: str, dry_run: bool) -> bool:
         print("  [DRY-RUN] 跳过安装")
         return True
 
-    r = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-    )
+    r = _run_install(hdc, hap_path)
     if r.returncode != 0:
-        print("[ERROR] 安装失败")
         output = (r.stdout or "") + (r.stderr or "")
-        for line in output.split("\n")[-10:]:
-            if line.strip():
-                print(f"  | {line.strip()}")
-        return False
+        can_retry = _is_existing_bundle_install_error(
+            output, bundle_name
+        ) and _bundle_exists_on_device(hdc, bundle_name)
+        if not can_retry:
+            print("[ERROR] 安装失败")
+            _print_output_tail(output)
+            return False
+
+        print(f"  [WARN] 安装失败，设备上已存在同包名应用: {bundle_name}")
+        _print_output_tail(output)
+        if not _clean_reinstall(
+            hdc, hap_path, bundle_name, require_uninstall_success=True
+        ):
+            return False
+    else:
+        print("  等待设备确认安装结果 ...")
+        if not _wait_for_bundle_on_device(hdc, bundle_name):
+            print(
+                f"  [WARN] 安装指令返回成功，但设备上未检测到包: {bundle_name}"
+            )
+            print("  尝试清理后重新安装一次")
+            if not _clean_reinstall(
+                hdc, hap_path, bundle_name, require_uninstall_success=False
+            ):
+                return False
+            if not _wait_for_bundle_on_device(hdc, bundle_name, attempts=3):
+                print(f"[ERROR] 安装校验失败，设备上仍未检测到包: {bundle_name}")
+                _print_output_tail((r.stdout or "") + (r.stderr or ""))
+                return False
+
     print("  [OK] 安装成功")
     return True
 
@@ -582,10 +728,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="HarmonyOS 配置/编译/部署/启动一体脚本"
     )
-    parser.add_argument("-y", "--yaml", required=True, help="YAML 配置文件路径")
+    parser.add_argument(
+        "-y", "--yaml", default="config.yaml", help="配置文件路径，默认: ./config.yaml"
+    )
     parser.add_argument("-p", "--project", required=True, help="鸿蒙工程根目录")
     parser.add_argument(
-        "--dry-run", action="store_true", help="仅预览，不实际编译/安装/启动"
+        "--dry-run",
+        action="store_true",
+        help="跳过实际编译/安装/启动；配置写入仍会执行",
     )
     parser.add_argument("--skip-build", action="store_true", help="跳过编译")
     parser.add_argument("--skip-config", action="store_true", help="跳过配置写入")
@@ -602,11 +752,12 @@ def main() -> None:
     for k, v in tools.items():
         print(f"  {k:8s} → {v}")
 
-    # ---- YAML ----
+    # ---- 配置文件 ----
     cfg = load_config(args.yaml)
     bundle = cfg["bundleName"]
     signing = cfg["signingConfigs"]
-    print(f"\nYAML 配置:")
+    print(f"\n配置文件:")
+    print(f"  path:           {args.yaml}")
     print(f"  bundleName:     {bundle}")
     print(f"  signingConfigs: {len(signing)} 组")
 
@@ -641,7 +792,7 @@ def main() -> None:
             sys.exit("[ABORT] 未找到 HAP")
 
     # ---- 5. 安装 ----
-    if not install(tools["hdc"], hap, args.dry_run):
+    if not install(tools["hdc"], hap, bundle, args.dry_run):
         sys.exit("\n[ABORT] 安装失败")
 
     # ---- 6. 启动 ----
